@@ -169,15 +169,30 @@ unset($item);
 ```apache
 Options -Indexes
 RewriteEngine On
+# Do NOT add RewriteBase / — it breaks subfolder installs by resolving targets from document root
+
+# Old WP URL redirects — use %{REQUEST_URI} capture to preserve subfolder prefix
+RewriteCond %{REQUEST_URI} ^(.*/)old-slug/?$
+RewriteRule ^ %1new-slug [R=301,L]
+
+# Strip .php extension — capture full path from THE_REQUEST
+RewriteCond %{THE_REQUEST} \s(/[^\s?]+)\.php[\s?] [NC]
+RewriteRule ^(.+)\.php$ %1 [R=301,L]
+
 # Clean URLs — use %{REQUEST_FILENAME}.php not %{DOCUMENT_ROOT} (subfolder-safe)
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteCond %{REQUEST_FILENAME}.php -f
 RewriteRule ^(.+)$ $1.php [L]
+
+# 404 fallback — must be AFTER all redirects and clean URL rules
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . 404.php [L]
 # Block includes, POST-only forms, security headers, gzip, cache
 ```
 
-**301 redirects** from old WP URLs must use **relative paths** (no leading `/`) for subfolder portability.
+**301 redirects** from old WP URLs must use `%{REQUEST_URI}` backreference capture `^(.*/)` to auto-detect the subfolder prefix — relative targets without `RewriteBase` get filesystem paths prepended.
 
 ### Phase 4: Design Migration
 
@@ -235,7 +250,7 @@ Launch three parallel review agents after building and polishing all pages:
 - Mail injection: strip `"<>` from name fields, use email-only Reply-To (no `$name <$email>` format), RFC 2047 encode UTF-8 subjects
 - Remove `@` error suppression on `mail()`
 - Validate `lang` POST param against whitelist `['en', 'el']`
-- Add Content-Security-Policy header (whitelist Google Fonts, Maps, Analytics domains)
+- Add Content-Security-Policy header (whitelist Google Fonts, Maps, Analytics domains). **Must include `'unsafe-inline'` in `style-src`** if using inline `style="background-image: url(...)"` on slider slides — without it, CSP silently blocks inline styles and hero images won't load
 - Add cache-busting: `asset()` helper should append `?v=` + `filemtime()` for CSS/JS
 - Remove redundant font preload (preload + stylesheet is double-fetch; keep only stylesheet with `display=swap`)
 - Honeypot field needs `aria-hidden="true"` for screen readers
@@ -282,14 +297,19 @@ Run PHP syntax check on all files after fixes: `find . -name "*.php" -exec php -
 The site must work in any folder or subfolder without config changes:
 
 ### BASE_PATH Auto-Detection
-Use `REQUEST_URI` (not `DOCUMENT_ROOT` subtraction or `SCRIPT_NAME` — both are unreliable on shared hosting):
+Use `DOCUMENT_ROOT` subtraction (not `REQUEST_URI` — clean URLs without `.php` extensions make it impossible to reliably strip the page name from the path):
 ```php
-$_requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
-$_basePath = preg_replace('#/(en|el|forms)(/.*)?$#', '', $_requestPath);
-$_basePath = preg_replace('#/[^/]*\.php$#', '', $_basePath);
-$_basePath = rtrim($_basePath, '/');
+$_docRoot = rtrim(str_replace('\\', '/', $_SERVER['DOCUMENT_ROOT'] ?? ''), '/');
+$_rootDir = rtrim(str_replace('\\', '/', ROOT_DIR), '/');
+$_basePath = '';
+if ($_docRoot !== '' && stripos($_rootDir, $_docRoot) === 0) {
+    $_basePath = substr($_rootDir, strlen($_docRoot));
+}
 define('BASE_PATH', $_basePath);
 ```
+**Why not `REQUEST_URI`?** With clean URLs enabled, visiting `/subfolder/apartments` gives a `REQUEST_URI` of `/subfolder/apartments` — there's no `.php` extension to strip, so the regex can't distinguish the base path from the page name. Every inner page would compute a different (wrong) BASE_PATH. `DOCUMENT_ROOT` subtraction computes the same correct value regardless of which page is loaded.
+
+**Why not `SCRIPT_NAME`?** Some cPanel/LiteSpeed hosts report filesystem paths like `/home/user/public_html/` instead of web-relative paths.
 
 ### SITE_URL Auto-Detection for Dev
 ```php
@@ -303,16 +323,29 @@ if ($_host === 'example.com' || $_host === 'www.example.com') {
 ```
 
 ### .htaccess Portability Rules
-- **Always add `RewriteBase /`** after `RewriteEngine On` — without it, cPanel/LiteSpeed hosts prepend the filesystem path to all relative rewrite targets
-- `.php` strip redirect: use `$1` not `/$1` (relative, not absolute)
+- **Do NOT add `RewriteBase /`** — it causes Apache to resolve all rewrite targets from the document root, which breaks clean URLs and internal rewrites when the site is in a subfolder. Without `RewriteBase`, Apache defaults to the `.htaccess` directory, which is correct.
+- `.php` strip redirect must capture from `THE_REQUEST` and use that as the target:
+  ```apache
+  RewriteCond %{THE_REQUEST} \s(/[^\s?]+)\.php[\s?] [NC]
+  RewriteRule ^(.+)\.php$ %1 [R=301,L]
+  ```
+- 301 redirects from old WP URLs must use `%{REQUEST_URI}` capture to preserve the subfolder prefix:
+  ```apache
+  RewriteCond %{REQUEST_URI} ^(.*/)old-page/?$
+  RewriteRule ^ %1new-page [R=301,L]
+  ```
+  Without this, redirect targets get the filesystem path prepended (e.g., `C:/xampp/htdocs/...`).
 - 404 handler: use rewrite fallback, not `ErrorDocument 404 /404.php` (absolute path breaks in subfolders)
-- All redirect targets use relative paths (no leading `/`)
+- Internal rewrites (clean URLs, 404 fallback) use relative targets — these work correctly without `RewriteBase`
 
 ### Portability Checklist
 - All navigational links use `url()` helper
 - All asset references use `asset()` helper
 - `SITE_URL` is only used for SEO tags (canonical, OG, schema, hreflang) — never for navigational links
 - `BASE_PATH` works at: document root, any subfolder depth, localhost, production
+- No `RewriteBase` in `.htaccess` — Apache defaults to `.htaccess` directory which is correct
+- Canonical URLs use `parse_url(REQUEST_URI, PHP_URL_PATH)` to strip query strings
+- `session_start()` only called on form pages (contact, reservations, handler) — not on every page
 - Test by accessing site from different paths without changing any file
 
 ## Critical Lessons Learned
@@ -335,14 +368,30 @@ if ($_host === 'example.com' || $_host === 'www.example.com') {
 | CSRF bypass with empty token | `hash_equals('','')` is true — always reject when session token is empty |
 | XSS via `REQUEST_URI` | Always `e()` any output derived from `$_SERVER` superglobals |
 | Mail injection via Reply-To | Use email-only Reply-To, strip `"<>` from name, RFC 2047 encode subjects |
-| `DOCUMENT_ROOT` wrong on shared hosting | Use `REQUEST_URI` for BASE_PATH detection, not `DOCUMENT_ROOT` subtraction |
-| `SCRIPT_NAME` returns filesystem path | Some cPanel/LiteSpeed hosts report `/home/user/public_html/` — use `REQUEST_URI` instead |
-| Redirects prepend filesystem path | Always add `RewriteBase /` after `RewriteEngine On` on cPanel/LiteSpeed |
+| `REQUEST_URI` BASE_PATH fails with clean URLs | Clean URLs have no `.php` to strip, so every page computes a different wrong BASE_PATH. Use `DOCUMENT_ROOT` subtraction instead |
+| `SCRIPT_NAME` returns filesystem path | Some cPanel/LiteSpeed hosts report `/home/user/public_html/` — avoid for BASE_PATH |
+| `RewriteBase /` breaks subfolder installs | Causes Apache to resolve rewrite targets from document root. Remove it — Apache defaults to the `.htaccess` directory, which is correct |
+| Redirects prepend filesystem path (no RewriteBase) | Use `%{REQUEST_URI}` capture: `RewriteCond %{REQUEST_URI} ^(.*/)old-page/?$` then `RewriteRule ^ %1new-page [R=301,L]` |
+| CSP blocks inline `background-image` on slider | `style-src 'self'` silently blocks inline `style=""` attributes. Add `'unsafe-inline'` to `style-src` if using inline background images |
+| Sessions on every page wastes resources | Only call `session_start()` on pages that need CSRF (contact, reservations, form handler) — avoids unnecessary cookies and GDPR concerns |
+| Canonical URL reflects query strings | Use `parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH)` for canonical — strip `?utm_source=` etc. to prevent duplicate indexing |
 | `ErrorDocument 404` breaks in subfolder | Use rewrite fallback: `RewriteRule . 404.php [L]` with conditions for !-f !-d !.php |
 | `vh` wrong on mobile browsers | Add `svh` fallback: `height: 70vh; height: 70svh;` |
 | Slideshow double-speed bug | Always `clearInterval(timer)` before any new `setInterval()` |
 | Mobile nav stays open | Add document click listener to close nav on outside tap |
 | Schema.org in JSON-LD corrupted | Use `json_encode()` with `JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE`, never `htmlspecialchars()` |
+| YouTube hero shows image first | Remove `loading="lazy"` from video iframe. Set iframe z-index above fallback (iframe z-index: 2, fallback z-index: 1). Fallback fades out on iframe `load` event |
+| Google Maps requires API key | Use keyless embed: `maps.google.com/maps?q=LAT,LON&z=ZOOM&output=embed`. Add `maps.google.com` to CSP `frame-src` |
+| ESPA/government banner is a plain image | Check original WP content — these banners usually link to PDF documents. Copy the PDFs and wrap the image in `<a>` with `target="_blank"` |
+| ESPA banner as separate section looks disconnected | Integrate inside the footer as `.footer-espa` with `opacity: 0.85`, subtle background, and compact `max-height: 60px` — cleaner than a full-width white block |
+| Hardcoded `https://` breaks on servers without SSL | Don't assume HTTPS. Check if the production server has SSL. Set `SITE_URL`, sitemap, and robots.txt to match the actual protocol (`http://` or `https://`). Keep HTTPS redirect commented until SSL is installed |
+| GA4 needs extra CSP domains | Whitelist in `connect-src`: `https://www.google-analytics.com`, `https://*.google-analytics.com`, `https://*.analytics.google.com`, `https://www.googletagmanager.com`. Also add GA domains to `img-src` |
+| WooCommerce in catalog mode has no products | Check `catalog_mode` in Woodmart options. If enabled with zero published products, skip product migration entirely — the store was display-only |
+| CSS `scroll-behavior: smooth` conflicts with JS offset scroll | Remove CSS `scroll-behavior: smooth` from `html` when using JS `window.scrollTo({ behavior: 'smooth' })` with header offset — the two mechanisms interfere |
+| Schema.org missing `openingHoursSpecification` | Google uses business hours in search results and Maps panels. Always add `openingHoursSpecification` to the JSON-LD schema — ask the client for hours |
+| `og:image:alt` meta tag missing | Add `<meta property="og:image:alt">` — Facebook and accessibility tools use it. Can mirror the page title |
+| Schema.org empty `sameAs` array | Either populate with social media URLs or remove entirely — an empty `[]` adds no value and confuses validators |
+| `.gitignore` for WP migration repos | Exclude `wordpress/`, `*.sql`, `*.zip`, `.claude/` — only commit `public_html/` to keep the repo clean |
 
 ## Review Checklist (Run Before Launch)
 
@@ -350,8 +399,10 @@ if ($_host === 'example.com' || $_host === 'www.example.com') {
 
 **Security:** CSRF, honeypot, rate-limit per form, POST check, XSS escaping (`e()` everywhere), includes blocked in .htaccess, no API keys in client code
 
-**SEO:** Single h1 per page, meta descriptions 150-160 chars, schema.org correct type, canonical URLs, unique OG images, sitemap, LCP preload hint for hero
+**SEO:** Single h1 per page, meta descriptions 150-160 chars, schema.org correct type + `openingHoursSpecification`, `og:image:alt`, canonical URLs, unique OG images, sitemap, LCP preload hint for hero
 
-**Performance:** Minified CSS/JS (not just concatenated), images optimized, lazy loading, gzip includes `application/json` + `text/xml`, deferred scripts, non-blocking fonts
+**Performance:** Minified CSS/JS (not just concatenated), images optimized, lazy loading (but NOT on hero video iframe), gzip includes `application/json` + `text/xml`, deferred scripts, non-blocking fonts
 
 **Accessibility:** Color contrast 4.5:1 on text, focus outlines not removed, ARIA labels on interactive elements
+
+**Deployment:** Verify SSL before using `https://` in SITE_URL/sitemap/robots. Check `mail()` works on production host. `.gitignore` excludes `wordpress/`, `*.sql`, `*.zip`. Check ESPA/government banners link to their PDF documents. Google Maps embed uses keyless URL if no API key available
